@@ -175,10 +175,10 @@ jobs:
           github.event_name == 'push' &&
           steps.plan_result.outputs.result == 'has_changes'
         run: |
-          terraform apply \
-            -var-file=terraform.tfvars.json \
-            -auto-approve \
-            tfplan
+          # ⚠️  Do NOT pass -var-file here.
+          # Variables are already baked into the saved tfplan file from the Plan step.
+          # Passing -var-file again causes: "Can't set variables when applying a saved plan"
+          terraform apply -auto-approve tfplan
           echo "✅ Apply complete."
 
       # ── Step 11: Save instance_id back to tfvars.json ─────

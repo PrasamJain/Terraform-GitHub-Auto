@@ -6,9 +6,17 @@
 #  2. Reads ec2_name from terraform.tfvars.json
 #  3. State file path → tfstates/<ec2_name>.tfstate
 #     • New name  = new state file = NEW EC2 created
-#     • Same name = same state file = EXISTING EC2 updated
+#     • Same name = same state file = EXISTING EC2 updated in-place
 #  4. On push to main: applies changes automatically
 #  5. Commits the updated state file back to the repo
+#
+#  ROOT CAUSE FIX:
+#    terraform apply needs BOTH flags:
+#      -state=<path>      ← where to READ existing state from
+#      -state-out=<path>  ← where to WRITE updated state after apply
+#    Without -state-out, Terraform silently writes to ./terraform.tfstate
+#    and the named state file in tfstates/ is NEVER updated.
+#    Next run then reads stale state → thinks EC2 is missing → creates duplicate.
 # ============================================================
 
 name: Terraform CI/CD
@@ -37,6 +45,8 @@ jobs:
       # ── Step 1: Get the code ──────────────────────────────
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so we can push commits back
 
       # ── Step 2: Install Terraform ─────────────────────────
       - name: Setup Terraform
@@ -45,7 +55,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       # ── Step 3: Connect to AWS ────────────────────────────
-      #    Secrets are set in: GitHub repo → Settings → Secrets
+      #    Add these in: GitHub repo → Settings → Secrets → Actions
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -54,64 +64,85 @@ jobs:
           aws-region:            us-east-1
 
       # ── Step 4: Read ec2_name from tfvars.json ────────────
-      #    This becomes the name of the .tfstate file
-      #    e.g. ec2_name = "my-server"  →  tfstates/my-server.tfstate
-      - name: Read EC2 Name from tfvars
+      #    ec2_name value becomes the .tfstate filename
+      #    e.g.  "my-server"  →  tfstates/my-server.tfstate
+      - name: Read EC2 Name & Set State Path
         id: ec2name
         run: |
           EC2_NAME=$(jq -r '.ec2_name' terraform.tfvars.json)
-          echo "EC2 name from tfvars: $EC2_NAME"
-          echo "name=$EC2_NAME" >> $GITHUB_OUTPUT
-          echo "state_path=tfstates/$EC2_NAME.tfstate" >> $GITHUB_OUTPUT
+          STATE_PATH="tfstates/${EC2_NAME}.tfstate"
+          echo "EC2 name   : $EC2_NAME"
+          echo "State file : $STATE_PATH"
+          echo "name=$EC2_NAME"       >> $GITHUB_OUTPUT
+          echo "state_path=$STATE_PATH" >> $GITHUB_OUTPUT
 
-      # ── Step 5: Terraform Init ────────────────────────────
+      # ── Step 5: Ensure tfstates/ folder exists ────────────
+      - name: Create tfstates directory if missing
+        run: mkdir -p tfstates
+
+      # ── Step 6: Terraform Init ────────────────────────────
       - name: Terraform Init
         run: terraform init
 
-      # ── Step 6: Format Check (warns, does not fail) ───────
+      # ── Step 7: Format Check (warns, does not fail) ───────
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
         continue-on-error: true
 
-      # ── Step 7: Validate config syntax ───────────────────
+      # ── Step 8: Validate config syntax ────────────────────
       - name: Terraform Validate
         run: terraform validate
 
-      # ── Step 8: Plan (show what WILL change) ─────────────
-      #    -state flag points to the named state file
-      #    -var-file loads all values from terraform.tfvars.json
+      # ── Step 9: Terraform Plan ────────────────────────────
+      #    -state      → read existing state from named file
+      #                   (first run: file doesn't exist yet, that's OK)
+      #    -var-file   → load all variable values from tfvars.json
+      #    -out=tfplan → save the plan so Apply uses exactly this plan
       - name: Terraform Plan
         run: |
           terraform plan \
             -var-file=terraform.tfvars.json \
             -state=${{ steps.ec2name.outputs.state_path }} \
             -out=tfplan
-        env:
-          TF_LOG: INFO
 
-      # ── Step 9: Apply (only on push to main) ─────────────
-      #    -state-out writes the updated state back to the same file
+      # ── Step 10: Terraform Apply ───────────────────────────
+      #    Only runs on direct push to main (not on PRs)
+      #
+      #    ⚠️  KEY FIX: -state-out MUST match -state
+      #    -state     → where to read current state (same as plan)
+      #    -state-out → where to WRITE the updated state after apply
+      #
+      #    Without -state-out, Terraform writes to ./terraform.tfstate
+      #    and your named state file stays stale → duplicates on next run!
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           terraform apply \
             -state=${{ steps.ec2name.outputs.state_path }} \
+            -state-out=${{ steps.ec2name.outputs.state_path }} \
             -auto-approve \
             tfplan
 
-      # ── Step 10: Commit updated state file back to repo ──
-      #    The state file tracks what Terraform already created.
-      #    Without saving it, Terraform would try to create duplicates.
+      # ── Step 11: Commit updated state file back to repo ───
+      #    The state file records what Terraform created in AWS.
+      #    We save it in git so the NEXT pipeline run can read it
+      #    and know the EC2 already exists (update) vs not (create).
       - name: Save State File to Repository
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Pull latest before pushing to avoid stale ref errors
+          git pull --rebase origin main
+
           git add tfstates/
+
           # Only commit if the state file actually changed
           if git diff --staged --quiet; then
-            echo "No state changes to commit."
+            echo "✅ No state changes – nothing to commit."
           else
             git commit -m "ci: update tfstate for EC2 → ${{ steps.ec2name.outputs.name }}"
-            git push
+            git push origin main
+            echo "✅ State file committed and pushed."
           fi

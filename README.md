@@ -1,7 +1,7 @@
 # Terraform-GitHub-Auto
 
-> Beginner-friendly Terraform project to create and manage AWS EC2 instances via GitHub Actions.
-> Uses **S3 backend** for state — Terraform automatically tracks what exists vs what you want.
+> Manage **multiple AWS resources** (EC2, S3, IAM, and more) from one pipeline.
+> One tfstate in S3. One `terraform.tfvars.json` to control everything.
 
 ---
 
@@ -9,47 +9,110 @@
 
 ```
 Terraform-GitHub-Auto/
-├── main.tf                    ← Provider + S3 backend + module call
-├── variables.tf               ← Variable declarations
-├── terraform.tfvars.json      ← ✏️  Only file you need to edit
+├── main.tf                    ← All module calls live here
+├── variables.tf               ← Variable type declarations
+├── terraform.tfvars.json      ← ✏️  Define ALL your resources here
 ├── modules/
-│   └── ec2/
-│       ├── main.tf            ← EC2 resource
-│       ├── variables.tf       ← Module inputs
-│       └── outputs.tf         ← instance_id, public_ip, etc.
+│   ├── ec2/                   ← EC2 instance module
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── s3/                    ← S3 bucket module
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   └── iam/                   ← IAM user module
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
 └── .github/
     └── workflows/
-        └── terraform.yml      ← CI/CD pipeline (plan + apply)
+        └── terraform.yml      ← CI/CD pipeline (unchanged)
 ```
 
 ---
 
-## ⚙️ One-Time Setup (run once before first pipeline run)
+## 🗂️ How One tfstate Tracks All Resources
+
+```
+S3: terraform-state-bucket-prasamjain
+└── terraform/all-resources/terraform.tfstate
+      │
+      ├── module.ec2["web-server"].aws_instance.this       → i-0abc111
+      ├── module.ec2["app-server"].aws_instance.this       → i-0abc222
+      ├── module.s3["prasamjain-app-uploads"].aws_s3_bucket.this
+      ├── module.s3["prasamjain-logs"].aws_s3_bucket.this
+      ├── module.iam["dev-user"].aws_iam_user.this
+      └── module.iam["ci-bot"].aws_iam_user.this
+```
+
+---
+
+## ✏️ terraform.tfvars.json — Control Everything Here
+
+```json
+{
+  "aws_region": "us-east-1",
+
+  "ec2_instances": {
+    "web-server": { "ami": "ami-xxx", "instance_type": "t3.micro", ... },
+    "app-server": { "ami": "ami-xxx", "instance_type": "t3.small", ... }
+  },
+
+  "s3_buckets": {
+    "my-app-uploads": { "versioning_enabled": true,  "force_destroy": false, ... },
+    "my-logs":        { "versioning_enabled": false, "force_destroy": true,  ... }
+  },
+
+  "iam_users": {
+    "dev-user": { "path": "/", "policy_arns": ["arn:aws:iam::aws:policy/ReadOnlyAccess"], ... },
+    "ci-bot":   { "path": "/bots/", "policy_arns": ["arn:aws:iam::aws:policy/AmazonS3FullAccess"], ... }
+  }
+}
+```
+
+---
+
+## 🔄 Behaviour for Every Resource Type
+
+| Action in tfvars | What Terraform does | Other resources |
+|---|---|---|
+| Re-run, nothing changed | `No changes` | Untouched |
+| Add a new key to any map | Creates only that new resource | Untouched |
+| Remove a key from any map | Destroys only that resource | Untouched |
+| Change a value (e.g. instance_type) | Updates only that resource | Untouched |
+
+---
+
+## ➕ How to Add a New Resource Type (e.g. RDS, SQS, VPC)
+
+1. Create `modules/rds/main.tf`, `variables.tf`, `outputs.tf`
+2. Add a `module "rds"` block in `main.tf` with `for_each`
+3. Add a `variable "rds_instances"` block in `variables.tf`
+4. Add `"rds_instances": { ... }` section in `terraform.tfvars.json`
+5. Push to main → same pipeline runs, same S3 state tracks everything ✅
+
+---
+
+## ⚙️ One-Time Setup
 
 ```bash
-# 1. Create S3 bucket for state storage (must be globally unique)
-aws s3api create-bucket \
-  --bucket terraform-state-bucket-prasamjain \
-  --region us-east-1
-
-# 2. Enable versioning (allows rollback if state gets corrupted)
+# Create S3 bucket for state
+aws s3api create-bucket --bucket terraform-state-bucket-prasamjain --region us-east-1
 aws s3api put-bucket-versioning \
   --bucket terraform-state-bucket-prasamjain \
   --versioning-configuration Status=Enabled
 
-# 3. Create DynamoDB table for state locking
-#    (prevents two pipeline runs from corrupting state simultaneously)
+# Create DynamoDB table for state locking
 aws dynamodb create-table \
   --table-name terraform-state-lock \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST \
   --region us-east-1
-
-# 4. Update bucket name in main.tf backend block to match step 1
 ```
 
-Then add GitHub Secrets at **Repo → Settings → Secrets → Actions**:
+GitHub Secrets at **Repo → Settings → Secrets → Actions**:
 
 | Secret | Value |
 |---|---|
@@ -58,61 +121,19 @@ Then add GitHub Secrets at **Repo → Settings → Secrets → Actions**:
 
 ---
 
-## ✏️ How to Use
+## 📊 Example Pipeline Output
 
-Just edit `terraform.tfvars.json` and push to main:
-
-```json
-{
-  "aws_region":    "us-east-1",
-  "ec2_name":      "my-first-ec2",
-  "ami":           "ami-0c02fb55956c7d316",
-  "instance_type": "t3.micro",
-  "key_name":      "",
-  "tags": {
-    "Environment": "dev"
-  }
+```
+ec2_instance_ids = {
+  "app-server" = "i-0abc222"
+  "web-server" = "i-0abc111"
 }
-```
-
----
-
-## 🔄 How It Works — Current vs Desired State
-
-```
-Every pipeline run:
-
-  terraform init
-    └─ Downloads current tfstate from S3
-       (this is what actually exists in AWS right now)
-
-  terraform plan
-    └─ Compares: S3 state (current) vs tfvars.json (desired)
-       ┌─────────────────────────────────────────────────────┐
-       │ Nothing changed?  → "No changes"  → apply skipped  │
-       │ Something changed? → shows diff   → apply runs      │
-       └─────────────────────────────────────────────────────┘
-
-  terraform apply  (only if changes exist)
-    └─ Updates AWS infra
-    └─ Uploads new state to S3 automatically
-```
-
-| Scenario | Plan output | What happens |
-|---|---|---|
-| Re-run, nothing changed | `No changes` | Apply skipped, no new EC2 |
-| Changed `instance_type` | `1 to change` | Existing EC2 updated in place |
-| Changed `ec2_name` | `1 to change` | Name tag updated on existing EC2 |
-
----
-
-## 🚀 Running Locally
-
-```bash
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-
-terraform init                                  # connects to S3, downloads state
-terraform plan -var-file=terraform.tfvars.json  # see what would change
-terraform apply -var-file=terraform.tfvars.json # apply changes
+s3_bucket_arns = {
+  "prasamjain-app-uploads" = "arn:aws:s3:::prasamjain-app-uploads"
+  "prasamjain-logs"        = "arn:aws:s3:::prasamjain-logs"
+}
+iam_user_arns = {
+  "ci-bot"   = "arn:aws:iam::123456789:user/bots/ci-bot"
+  "dev-user" = "arn:aws:iam::123456789:user/dev-user"
+}
 ```

@@ -1,31 +1,30 @@
 # ============================================================
-#  modules/ec2/variables.tf  –  Inputs accepted by this module
+#  modules/ec2/variables.tf
 # ============================================================
 
 variable "ec2_name" {
-  description = "Name tag for the EC2 instance"
+  description = "Name tag and unique key for this EC2 instance"
   type        = string
 }
 
 variable "ami" {
-  description = "AMI ID to use for the EC2 instance"
+  description = "AMI ID to launch (must exist in the selected region)"
   type        = string
 }
 
 variable "instance_type" {
-  description = "EC2 instance type"
+  description = "EC2 instance type e.g. t3.micro, t3.small"
   type        = string
-  default     = "t3.micro"
 }
 
 variable "key_name" {
-  description = "EC2 Key Pair name for SSH (empty = no key)"
+  description = "EC2 Key Pair name for SSH access (empty string = no key)"
   type        = string
   default     = ""
 }
 
 variable "tags" {
-  description = "Additional resource tags"
+  description = "Extra tags to apply on top of the Name tag"
   type        = map(string)
   default     = {}
 }

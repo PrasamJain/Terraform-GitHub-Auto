@@ -1,19 +1,19 @@
 # ============================================================
-#  modules/ec2/outputs.tf  –  Values this module exposes
+#  modules/ec2/outputs.tf
 # ============================================================
 
 output "instance_id" {
-  description = "The unique ID of the EC2 instance (e.g. i-0abc123)"
+  description = "Unique AWS instance ID e.g. i-0abc1234567890"
   value       = aws_instance.this.id
 }
 
 output "public_ip" {
-  description = "Public IP address (empty if instance has no public IP)"
+  description = "Public IP address (empty if no public IP assigned)"
   value       = aws_instance.this.public_ip
 }
 
 output "private_ip" {
-  description = "Private IP address of the EC2 instance"
+  description = "Private IP address inside the VPC"
   value       = aws_instance.this.private_ip
 }
 

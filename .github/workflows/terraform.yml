@@ -1,22 +1,40 @@
 # ============================================================
 #  .github/workflows/terraform.yml
 #
-#  BEGINNER GUIDE – What this pipeline does:
-#  1. Triggered on every push / PR to main branch
-#  2. Reads ec2_name from terraform.tfvars.json
-#  3. State file path → tfstates/<ec2_name>.tfstate
-#     • New name  = new state file = NEW EC2 created
-#     • Same name = same state file = EXISTING EC2 updated in-place
-#  4. On push to main: applies changes automatically
-#  5. Commits the updated state file back to the repo
+#  BEGINNER GUIDE – How this pipeline works:
 #
-#  ROOT CAUSE FIX:
-#    terraform apply needs BOTH flags:
-#      -state=<path>      ← where to READ existing state from
-#      -state-out=<path>  ← where to WRITE updated state after apply
-#    Without -state-out, Terraform silently writes to ./terraform.tfstate
-#    and the named state file in tfstates/ is NEVER updated.
-#    Next run then reads stale state → thinks EC2 is missing → creates duplicate.
+#  WHY NAME TAGS DON'T WORK FOR UNIQUENESS:
+#    AWS allows multiple EC2s with the exact same Name tag.
+#    Terraform does NOT look at Name tags to decide if an EC2
+#    already exists. It only knows about resources that are
+#    recorded in its state file.
+#
+#  THE REAL FIX – instance_id based tracking:
+#    AWS gives every EC2 a truly unique ID: i-0abc1234567890
+#    We store this in terraform.tfvars.json after first creation.
+#    On every re-run the pipeline does:
+#      1. Read instance_id from tfvars.json
+#      2. If instance_id is non-empty → run "terraform import"
+#         This tells Terraform: "this EC2 already exists in AWS,
+#         here is its real ID, put it in your local state"
+#      3. terraform plan now sees the existing EC2 → shows 0 to add
+#      4. terraform apply only runs if you actually changed something
+#         (e.g. instance_type, tags, ami)
+#      5. After apply, write the instance_id back to tfvars.json
+#         and commit it so the next run can import it again
+#
+#  FIRST RUN (instance_id is empty):
+#    → No import step → Terraform creates the EC2 → gets instance_id
+#    → Pipeline writes instance_id to tfvars.json → commits to repo
+#
+#  SECOND+ RUN (instance_id is set, nothing changed):
+#    → Import step runs → Terraform recognises the EC2
+#    → terraform plan shows: No changes. Your infrastructure matches.
+#
+#  CHANGE SOMETHING (e.g. instance_type):
+#    → Import step runs → Terraform recognises the EC2
+#    → terraform plan shows: 1 to change (the thing you changed)
+#    → terraform apply updates the EXISTING EC2 (no new one created)
 # ============================================================
 
 name: Terraform CI/CD
@@ -38,24 +56,26 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write   # needed to commit state file back to repo
+      contents: write   # needed to commit tfvars.json back to repo
 
     steps:
 
-      # ── Step 1: Get the code ──────────────────────────────
+      # ── Step 1: Checkout code ─────────────────────────────
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history so we can push commits back
+          fetch-depth: 0   # full history needed to push commits back
 
       # ── Step 2: Install Terraform ─────────────────────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false   # disable wrapper so "terraform output" returns raw values
 
       # ── Step 3: Connect to AWS ────────────────────────────
-      #    Add these in: GitHub repo → Settings → Secrets → Actions
+      #    Set these in: GitHub repo → Settings → Secrets → Actions
+      #    Required secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -63,86 +83,147 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            us-east-1
 
-      # ── Step 4: Read ec2_name from tfvars.json ────────────
-      #    ec2_name value becomes the .tfstate filename
-      #    e.g.  "my-server"  →  tfstates/my-server.tfstate
-      - name: Read EC2 Name & Set State Path
-        id: ec2name
+      # ── Step 4: Read instance_id and ec2_name from tfvars ─
+      #    instance_id is empty on first run → no import
+      #    instance_id is set on re-runs    → import existing EC2
+      - name: Read Variables from tfvars.json
+        id: vars
         run: |
-          EC2_NAME=$(jq -r '.ec2_name' terraform.tfvars.json)
-          STATE_PATH="tfstates/${EC2_NAME}.tfstate"
-          echo "EC2 name   : $EC2_NAME"
-          echo "State file : $STATE_PATH"
-          echo "name=$EC2_NAME"       >> $GITHUB_OUTPUT
-          echo "state_path=$STATE_PATH" >> $GITHUB_OUTPUT
+          EC2_NAME=$(jq -r '.ec2_name'    terraform.tfvars.json)
+          INSTANCE_ID=$(jq -r '.instance_id' terraform.tfvars.json)
+          echo "ec2_name    : $EC2_NAME"
+          echo "instance_id : ${INSTANCE_ID:-<empty – first run>}"
+          echo "ec2_name=$EC2_NAME"       >> $GITHUB_OUTPUT
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
-      # ── Step 5: Ensure tfstates/ folder exists ────────────
-      - name: Create tfstates directory if missing
-        run: mkdir -p tfstates
-
-      # ── Step 6: Terraform Init ────────────────────────────
+      # ── Step 5: Terraform Init ────────────────────────────
       - name: Terraform Init
         run: terraform init
 
-      # ── Step 7: Format Check (warns, does not fail) ───────
+      # ── Step 6: Format Check ──────────────────────────────
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
         continue-on-error: true
 
-      # ── Step 8: Validate config syntax ────────────────────
+      # ── Step 7: Validate ──────────────────────────────────
       - name: Terraform Validate
         run: terraform validate
 
+      # ── Step 8: Import existing EC2 into local state ──────
+      #
+      #    This is the KEY STEP that fixes the duplicate EC2 problem.
+      #
+      #    What "terraform import" does:
+      #      It queries AWS using the real instance ID (i-0abc1234)
+      #      and records that instance in Terraform's local state.
+      #      After import, Terraform KNOWS this EC2 already exists.
+      #      So terraform plan will show 0 to add instead of 1 to add.
+      #
+      #    The import address "module.ec2.aws_instance.this" matches
+      #    the resource defined in modules/ec2/main.tf as:
+      #        resource "aws_instance" "this" { ... }
+      #    called via module "ec2" in main.tf.
+      #
+      #    We skip this step on first run when instance_id is empty.
+      - name: Import Existing EC2 into Terraform State
+        if: steps.vars.outputs.instance_id != '' && steps.vars.outputs.instance_id != 'null'
+        run: |
+          echo "📥 Importing existing EC2: ${{ steps.vars.outputs.instance_id }}"
+          terraform import \
+            -var-file=terraform.tfvars.json \
+            module.ec2.aws_instance.this \
+            ${{ steps.vars.outputs.instance_id }}
+          echo "✅ Import done. Terraform now knows this EC2 exists."
+
       # ── Step 9: Terraform Plan ────────────────────────────
-      #    -state      → read existing state from named file
-      #                   (first run: file doesn't exist yet, that's OK)
-      #    -var-file   → load all variable values from tfvars.json
-      #    -out=tfplan → save the plan so Apply uses exactly this plan
+      #    After import, plan compares the imported state with your
+      #    tfvars config. If nothing changed → 0 to add, 0 to change.
       - name: Terraform Plan
         run: |
           terraform plan \
             -var-file=terraform.tfvars.json \
-            -state=${{ steps.ec2name.outputs.state_path }} \
-            -out=tfplan
+            -out=tfplan \
+            -detailed-exitcode
+        # Exit codes: 0 = no changes, 1 = error, 2 = changes present
+        continue-on-error: true
 
-      # ── Step 10: Terraform Apply ───────────────────────────
-      #    Only runs on direct push to main (not on PRs)
-      #
-      #    ⚠️  KEY FIX: -state-out MUST match -state
-      #    -state     → where to read current state (same as plan)
-      #    -state-out → where to WRITE the updated state after apply
-      #
-      #    Without -state-out, Terraform writes to ./terraform.tfstate
-      #    and your named state file stays stale → duplicates on next run!
+      - name: Check Plan Result
+        id: plan_result
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars.json \
+            -detailed-exitcode 2>&1 | tail -5
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "result=no_changes" >> $GITHUB_OUTPUT
+            echo "✅ No changes – infrastructure is up to date."
+          elif [ $EXIT_CODE -eq 2 ]; then
+            echo "result=has_changes" >> $GITHUB_OUTPUT
+            echo "⚠️  Changes detected – will apply."
+          else
+            echo "result=error" >> $GITHUB_OUTPUT
+            echo "❌ Plan failed."
+            exit 1
+          fi
+
+      # ── Step 10: Terraform Apply ──────────────────────────
+      #    Only runs on push to main AND only if plan found changes.
+      #    If plan shows 0 changes, apply is skipped entirely.
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: |
+          github.ref == 'refs/heads/main' &&
+          github.event_name == 'push' &&
+          steps.plan_result.outputs.result == 'has_changes'
         run: |
           terraform apply \
-            -state=${{ steps.ec2name.outputs.state_path }} \
-            -state-out=${{ steps.ec2name.outputs.state_path }} \
+            -var-file=terraform.tfvars.json \
             -auto-approve \
             tfplan
+          echo "✅ Apply complete."
 
-      # ── Step 11: Commit updated state file back to repo ───
-      #    The state file records what Terraform created in AWS.
-      #    We save it in git so the NEXT pipeline run can read it
-      #    and know the EC2 already exists (update) vs not (create).
-      - name: Save State File to Repository
+      # ── Step 11: Save instance_id back to tfvars.json ─────
+      #    After apply (or after import on re-runs), we read the
+      #    real instance_id from Terraform output and write it
+      #    back to terraform.tfvars.json.
+      #    This ensures the NEXT pipeline run can import it.
+      - name: Update instance_id in tfvars.json
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          # Read instance_id from Terraform output
+          INSTANCE_ID=$(terraform output -raw instance_id 2>/dev/null || echo "")
+
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "⚠️  Could not read instance_id from output. Skipping tfvars update."
+            exit 0
+          fi
+
+          echo "📝 Writing instance_id to tfvars.json: $INSTANCE_ID"
+
+          # Update instance_id field in terraform.tfvars.json using jq
+          jq --arg id "$INSTANCE_ID" '.instance_id = $id' terraform.tfvars.json > tmp.json
+          mv tmp.json terraform.tfvars.json
+
+          echo "✅ terraform.tfvars.json updated:"
+          cat terraform.tfvars.json
+
+      # ── Step 12: Commit updated tfvars.json back to repo ──
+      #    This saves the instance_id permanently in git so the
+      #    next pipeline run can read it and import the EC2.
+      - name: Commit instance_id to Repository
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Pull latest before pushing to avoid stale ref errors
+          # Pull latest to avoid push conflicts
           git pull --rebase origin main
 
-          git add tfstates/
+          git add terraform.tfvars.json
 
-          # Only commit if the state file actually changed
           if git diff --staged --quiet; then
-            echo "✅ No state changes – nothing to commit."
+            echo "✅ tfvars.json unchanged – nothing to commit."
           else
-            git commit -m "ci: update tfstate for EC2 → ${{ steps.ec2name.outputs.name }}"
+            git commit -m "ci: save instance_id for EC2 '${{ steps.vars.outputs.ec2_name }}' → $(jq -r '.instance_id' terraform.tfvars.json)"
             git push origin main
-            echo "✅ State file committed and pushed."
+            echo "✅ instance_id committed and pushed."
           fi

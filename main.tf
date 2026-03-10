@@ -2,13 +2,19 @@
 #  ROOT main.tf  –  Entry point for all infrastructure
 # ============================================================
 #
-#  HOW IT WORKS (beginner-friendly explanation):
-#  1. We declare the AWS provider here (region comes from tfvars)
-#  2. We call the "ec2" module – the module does the actual work
-#  3. All values are passed in via terraform.tfvars.json
-#  4. State file is saved as:  tfstates/<ec2_name>.tfstate
-#     → New name  = new state file (fresh EC2)
-#     → Same name = Terraform updates the existing EC2 in place
+#  HOW IT WORKS (beginner-friendly):
+#  1. AWS provider is declared here (region from tfvars)
+#  2. We call the "ec2" module which holds the EC2 resource
+#  3. All values come from terraform.tfvars.json
+#
+#  HOW UNIQUENESS WORKS:
+#  - AWS Name tags are NOT unique → Terraform cannot use them
+#    to find an existing EC2. Two EC2s can have the same name.
+#  - Terraform uses instance_id (e.g. i-0abc1234) as the real identifier.
+#  - The CI/CD pipeline stores instance_id in terraform.tfvars.json
+#    after the first creation, and imports it on every re-run.
+#  - This means: same ec2_name + same instance_id = update existing EC2
+#                new ec2_name + empty instance_id  = create new EC2
 # ============================================================
 
 terraform {
@@ -28,20 +34,19 @@ provider "aws" {
 }
 
 # ── EC2 Module ───────────────────────────────────────────────
-# This calls ./modules/ec2 and passes all required variables
 module "ec2" {
   source = "./modules/ec2"
 
-  ec2_name      = var.ec2_name       # Name tag on the instance
-  ami           = var.ami            # Amazon Machine Image ID
-  instance_type = var.instance_type  # e.g. t3.micro
-  key_name      = var.key_name       # SSH key pair name (optional)
-  tags          = var.tags           # Extra tags (optional)
+  ec2_name      = var.ec2_name
+  ami           = var.ami
+  instance_type = var.instance_type
+  key_name      = var.key_name
+  tags          = var.tags
 }
 
 # ── Outputs ──────────────────────────────────────────────────
 output "instance_id" {
-  description = "The ID of the EC2 instance"
+  description = "The unique AWS ID of the EC2 instance (e.g. i-0abc1234)"
   value       = module.ec2.instance_id
 }
 
@@ -51,6 +56,6 @@ output "public_ip" {
 }
 
 output "instance_state" {
-  description = "Current state of the EC2 instance"
+  description = "Current state: running / stopped / terminated"
   value       = module.ec2.instance_state
 }

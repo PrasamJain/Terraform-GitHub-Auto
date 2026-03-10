@@ -215,10 +215,12 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Pull latest to avoid push conflicts
-          git pull --rebase origin main
-
+          # Stage the file FIRST before rebasing.
+          # git pull --rebase fails if there are unstaged changes in the working tree.
           git add terraform.tfvars.json
+
+          # Now it is safe to pull and rebase — working tree is clean.
+          git pull --rebase origin main
 
           if git diff --staged --quiet; then
             echo "✅ tfvars.json unchanged – nothing to commit."

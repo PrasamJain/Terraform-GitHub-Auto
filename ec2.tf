@@ -1,4 +1,5 @@
-resource "aws_instance" "myfirstec2" {
-  ami = "ami-0532be01f26a3de55"
-  instance_type = "t3.micro"
-}
+# This file has been replaced by main.tf + modules/ec2/
+# All EC2 configuration now lives in:
+#   → modules/ec2/main.tf
+#   → terraform.tfvars.json  (for values)
+# Please do not add resources here.

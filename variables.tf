@@ -13,24 +13,11 @@ variable "aws_region" {
 variable "ec2_name" {
   description = <<-EOT
     Name tag for the EC2 instance.
-    NOTE: Name tags in AWS are NOT unique — Terraform does NOT use this
-    to identify if an EC2 already exists. The real unique ID is instance_id.
-    - Change this name → a NEW EC2 will be created (new instance_id)
-    - Keep same name   → existing EC2 is updated in-place
+    - Keep the same name → Terraform updates the EXISTING EC2 (state tracked in S3)
+    - Change this name   → Terraform renames the existing EC2 (updates Name tag only)
+    NOTE: To create a brand new EC2, change key in backend S3 path or use a new workspace.
   EOT
   type        = string
-}
-
-variable "instance_id" {
-  description = <<-EOT
-    AWS EC2 Instance ID (e.g. i-0abc1234567890).
-    - Leave EMPTY ("") on first run → pipeline creates EC2 and fills this automatically.
-    - After first run → pipeline writes the real instance_id here.
-    - On every re-run → pipeline imports this ID into state so Terraform
-      knows the EC2 already exists → plan shows 0 changes if nothing changed.
-  EOT
-  type    = string
-  default = ""
 }
 
 variable "ami" {

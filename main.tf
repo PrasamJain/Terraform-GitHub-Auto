@@ -2,19 +2,27 @@
 #  ROOT main.tf  –  Entry point for all infrastructure
 # ============================================================
 #
-#  HOW IT WORKS (beginner-friendly):
-#  1. AWS provider is declared here (region from tfvars)
-#  2. We call the "ec2" module which holds the EC2 resource
-#  3. All values come from terraform.tfvars.json
+#  HOW STATE WORKS (beginner-friendly):
 #
-#  HOW UNIQUENESS WORKS:
-#  - AWS Name tags are NOT unique → Terraform cannot use them
-#    to find an existing EC2. Two EC2s can have the same name.
-#  - Terraform uses instance_id (e.g. i-0abc1234) as the real identifier.
-#  - The CI/CD pipeline stores instance_id in terraform.tfvars.json
-#    after the first creation, and imports it on every re-run.
-#  - This means: same ec2_name + same instance_id = update existing EC2
-#                new ec2_name + empty instance_id  = create new EC2
+#  Terraform needs to remember what it already created in AWS
+#  so that next time it can compare "what exists" vs "what you want"
+#  and only make the difference. This memory is called the STATE FILE.
+#
+#  We store the state file in an AWS S3 bucket (not in git).
+#  S3 is persistent, shared, and accessible from every pipeline run.
+#
+#  Every pipeline run:
+#    1. terraform init  → connects to S3, downloads latest state
+#    2. terraform plan  → compares S3 state (current) vs tfvars (desired)
+#                         If nothing changed → "No changes"
+#                         If something changed → shows exactly what will change
+#    3. terraform apply → applies only the difference, uploads new state to S3
+#
+#  DynamoDB table is used for STATE LOCKING:
+#    Prevents two pipeline runs from running at the same time
+#    and corrupting the state file.
+#
+#  ✅ No more: instance_id in tfvars, terraform import, git commits of state
 # ============================================================
 
 terraform {
@@ -25,6 +33,39 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+  }
+
+  # ── S3 Backend – remote state storage ──────────────────────
+  # State file lives here: s3://<bucket>/terraform/ec2/terraform.tfstate
+  #
+  # ⚠️  ONE-TIME SETUP REQUIRED (do this once manually before first run):
+  #   1. Create S3 bucket:
+  #      aws s3api create-bucket \
+  #        --bucket terraform-state-<your-unique-name> \
+  #        --region us-east-1
+  #
+  #   2. Enable versioning (lets you roll back state if something goes wrong):
+  #      aws s3api put-bucket-versioning \
+  #        --bucket terraform-state-<your-unique-name> \
+  #        --versioning-configuration Status=Enabled
+  #
+  #   3. Create DynamoDB table for state locking:
+  #      aws dynamodb create-table \
+  #        --table-name terraform-state-lock \
+  #        --attribute-definitions AttributeName=LockID,AttributeType=S \
+  #        --key-schema AttributeName=LockID,KeyType=HASH \
+  #        --billing-mode PAY_PER_REQUEST \
+  #        --region us-east-1
+  #
+  #   4. Update the bucket name below to match what you created.
+  #   5. Add bucket name as GitHub Secret: TF_STATE_BUCKET
+  # ────────────────────────────────────────────────────────────
+  backend "s3" {
+    bucket         = "terraform-state-bucket-prasamjain"  # ← must match S3 bucket you created
+    key            = "terraform/ec2/terraform.tfstate"    # path inside bucket where state is saved
+    region         = "us-east-1"                          # must match bucket region
+    dynamodb_table = "terraform-state-lock"               # must match DynamoDB table you created
+    encrypt        = true                                 # encrypts state file at rest in S3
   }
 }
 

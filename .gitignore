@@ -1,0 +1,24 @@
+# ── Terraform default state files (root level) ───────────────
+# State is intentionally saved in tfstates/<name>.tfstate
+# The root terraform.tfstate should never be used in this project
+terraform.tfstate
+terraform.tfstate.backup
+
+# ── Terraform plan binary (regenerated each pipeline run) ────
+tfplan
+
+# ── Terraform working directory ──────────────────────────────
+.terraform/
+.terraform.lock.hcl
+
+# ── Crash logs ───────────────────────────────────────────────
+crash.log
+crash.*.log
+
+# ── Sensitive variable files (never commit these) ────────────
+*.tfvars         # plain .tfvars files can contain secrets
+# NOTE: terraform.tfvars.json is intentionally NOT ignored
+#       because it only has non-secret config in this project
+
+# ── macOS ─────────────────────────────────────────────────────
+.DS_Store

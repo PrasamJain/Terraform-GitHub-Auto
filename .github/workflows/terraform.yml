@@ -1,3 +1,16 @@
+# ============================================================
+#  .github/workflows/terraform.yml
+#
+#  BEGINNER GUIDE – What this pipeline does:
+#  1. Triggered on every push / PR to main branch
+#  2. Reads ec2_name from terraform.tfvars.json
+#  3. State file path → tfstates/<ec2_name>.tfstate
+#     • New name  = new state file = NEW EC2 created
+#     • Same name = same state file = EXISTING EC2 updated
+#  4. On push to main: applies changes automatically
+#  5. Commits the updated state file back to the repo
+# ============================================================
+
 name: Terraform CI/CD
 
 on:
@@ -13,25 +26,26 @@ env:
 
 jobs:
   terraform:
-    name: Terraform Plan & Apply
+    name: "Terraform Plan & Apply"
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: .  # Change this if your .tf files are in a subdirectory
+    permissions:
+      contents: write   # needed to commit state file back to repo
 
     steps:
-      # ── 1. Checkout code ──────────────────────────────────────────────────
+
+      # ── Step 1: Get the code ──────────────────────────────
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ── 2. Setup Terraform ────────────────────────────────────────────────
+      # ── Step 2: Install Terraform ─────────────────────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # ── 3. Configure AWS credentials from GitHub Secrets ─────────────────
+      # ── Step 3: Connect to AWS ────────────────────────────
+      #    Secrets are set in: GitHub repo → Settings → Secrets
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -39,28 +53,65 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            us-east-1
 
-      # ── 4. Terraform Init ─────────────────────────────────────────────────
+      # ── Step 4: Read ec2_name from tfvars.json ────────────
+      #    This becomes the name of the .tfstate file
+      #    e.g. ec2_name = "my-server"  →  tfstates/my-server.tfstate
+      - name: Read EC2 Name from tfvars
+        id: ec2name
+        run: |
+          EC2_NAME=$(jq -r '.ec2_name' terraform.tfvars.json)
+          echo "EC2 name from tfvars: $EC2_NAME"
+          echo "name=$EC2_NAME" >> $GITHUB_OUTPUT
+          echo "state_path=tfstates/$EC2_NAME.tfstate" >> $GITHUB_OUTPUT
+
+      # ── Step 5: Terraform Init ────────────────────────────
       - name: Terraform Init
         run: terraform init
 
-      # ── 5. Terraform Format Check ─────────────────────────────────────────
+      # ── Step 6: Format Check (warns, does not fail) ───────
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
-        continue-on-error: true   # warns but does not fail the pipeline
+        continue-on-error: true
 
-      # ── 6. Terraform Validate ─────────────────────────────────────────────
+      # ── Step 7: Validate config syntax ───────────────────
       - name: Terraform Validate
         run: terraform validate
 
-      # ── 7. Terraform Plan (runs on every push & PR) ───────────────────────
+      # ── Step 8: Plan (show what WILL change) ─────────────
+      #    -state flag points to the named state file
+      #    -var-file loads all values from terraform.tfvars.json
       - name: Terraform Plan
-        run: terraform plan -out=tfplan
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars.json \
+            -state=${{ steps.ec2name.outputs.state_path }} \
+            -out=tfplan
         env:
-          TF_VAR_github_token: ${{ secrets.TF_GITHUB_TOKEN }}
+          TF_LOG: INFO
 
-      # ── 8. Terraform Apply (only on push to main) ─────────────────────────
+      # ── Step 9: Apply (only on push to main) ─────────────
+      #    -state-out writes the updated state back to the same file
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve tfplan
-        env:
-          TF_VAR_github_token: ${{ secrets.TF_GITHUB_TOKEN }}
+        run: |
+          terraform apply \
+            -state=${{ steps.ec2name.outputs.state_path }} \
+            -auto-approve \
+            tfplan
+
+      # ── Step 10: Commit updated state file back to repo ──
+      #    The state file tracks what Terraform already created.
+      #    Without saving it, Terraform would try to create duplicates.
+      - name: Save State File to Repository
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tfstates/
+          # Only commit if the state file actually changed
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "ci: update tfstate for EC2 → ${{ steps.ec2name.outputs.name }}"
+            git push
+          fi

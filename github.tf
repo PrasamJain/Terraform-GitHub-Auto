@@ -1,3 +1,6 @@
+# github.tf – reserved for future GitHub provider resources
+# Currently unused. Uncomment and configure when needed.
+#
 # terraform {
 #   required_providers {
 #     github = {
@@ -6,22 +9,12 @@
 #     }
 #   }
 # }
-
-# # GitHub token is injected via TF_VAR_github_token (set as GitHub Actions Secret: GITHUB_TOKEN_TF)
+#
 # variable "github_token" {
-#   description = "GitHub Personal Access Token"
-#   type        = string
-#   sensitive   = true
+#   type      = string
+#   sensitive = true
 # }
-
-# # Configure the GitHub Provider
+#
 # provider "github" {
 #   token = var.github_token
-# }
-
-# resource "github_repository" "example" {
-#   name        = "example"
-#   description = "My awesome codebase"
-
-#   visibility = "public"
 # }
